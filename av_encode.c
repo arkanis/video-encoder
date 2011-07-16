@@ -424,13 +424,28 @@ int main(int argc, char **argv){
 		return 2;
 	
 	// Search for the first video and audio streams if the stream indecies are -1 (auto detect)
-	for(int i = 0; i < format_context_ptr->nb_streams; i++){
-		enum AVMediaType stream_type = format_context_ptr->streams[i]->codec->codec_type;
-		if (opts.video_stream_index == -1 && stream_type == AVMEDIA_TYPE_VIDEO)
-			opts.video_stream_index = i;
-		if (opts.audio_stream_index == -1 && stream_type == AVMEDIA_TYPE_AUDIO )
-			opts.audio_stream_index = i;
+	if (opts.video_stream_index == -1){
+		int selected_bitrate = -1;
+		for(int i = 0; i < format_context_ptr->nb_streams; i++){
+			AVCodecContext *codec_context_ptr = format_context_ptr->streams[i]->codec;
+			if ( codec_context_ptr->codec_type == AVMEDIA_TYPE_VIDEO && codec_context_ptr->bit_rate > selected_bitrate ){
+				opts.video_stream_index = i;
+				selected_bitrate = codec_context_ptr->bit_rate;
+			}
+		}
 	}
+	
+	if (opts.audio_stream_index == -1){
+		int selected_bitrate = -1;
+		for(int i = 0; i < format_context_ptr->nb_streams; i++){
+			AVCodecContext *codec_context_ptr = format_context_ptr->streams[i]->codec;
+			if ( codec_context_ptr->codec_type == AVMEDIA_TYPE_AUDIO && codec_context_ptr->bit_rate > selected_bitrate ){
+				opts.audio_stream_index = i;
+				selected_bitrate = codec_context_ptr->bit_rate;
+			}
+		}
+	}
+	
 	printf("Using video steam %d and audio steam %d\n", opts.video_stream_index, opts.audio_stream_index);
 	
 	
