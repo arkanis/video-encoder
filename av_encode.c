@@ -21,9 +21,9 @@
 #include <libavfilter/vsink_buffer.h>
 #include <libavfilter/avcodec.h>
 
-#include <x264.h>
-#include <faac.h>
-#include <mp4v2/mp4v2.h>
+#include "status.h"
+#include "mp4_encoder.h"
+
 
 /**
  * Small helper function that prints an error message followed by a description of
@@ -33,9 +33,9 @@ void av_perror(char *prefix, int error){
 	char message[255];
 	
 	if (av_strerror(error, message, 255) == 0)
-		fprintf(stderr, "%s: av error: %s\n", prefix, message);
+		status_info("%s: av error: %s\n", prefix, message);
 	else
-		fprintf(stderr, "%s: unknown av error, code: %d\n", prefix, error);
+		status_info("%s: unknown av error, code: %d\n", prefix, error);
 }
 
 /**
@@ -68,7 +68,7 @@ bool reader_open_file(char *filename, AVFormatContext **format_context_dptr){
  */
 bool reader_open_codec(AVFormatContext *format_context_ptr, int stream_index, enum AVMediaType required_stream_type, AVCodecContext **codec_context_dptr, AVCodec **codec_dptr){
 	if (stream_index < 0 || stream_index >= format_context_ptr->nb_streams){
-		fprintf(stderr, "Stream %d is an invalid stream index. Valid stream indices: 0 - %d\n",
+		status_info("Stream %d is an invalid stream index. Valid stream indices: 0 - %d\n",
 			stream_index, format_context_ptr->nb_streams - 1);
 		return false;
 	}
@@ -76,25 +76,25 @@ bool reader_open_codec(AVFormatContext *format_context_ptr, int stream_index, en
 	enum AVMediaType stream_type = format_context_ptr->streams[stream_index]->codec->codec_type;
 	if (required_stream_type != stream_type){
 		char *type_names[] = {"unknown", "video", "audio", "data", "subtitle", "attachment", "nb"};
-		fprintf(stderr, "Tried to use steam %d as %s steam but it is an %s steam!\n",
+		status_info("Tried to use steam %d as %s steam but it is an %s steam!\n",
 			stream_index, type_names[required_stream_type+1], type_names[stream_type+1]);
 		return false;
 	}
 	
 	*codec_context_dptr = format_context_ptr->streams[stream_index]->codec;
-	printf("Searching decoder for stream %d... ", stream_index);
+	status_info("Searching decoder for stream %d... ", stream_index);
 	*codec_dptr = avcodec_find_decoder((*codec_context_dptr)->codec_id);
 	if (*codec_dptr == NULL){
-		fprintf(stderr, "no matching codec found!\n");
+		status_info("no matching codec found!\n");
 		return false;
 	}
 	
 	if ( avcodec_open(*codec_context_dptr, *codec_dptr) != 0 ){
-		fprintf(stderr, "initialization of %s failed!\n", (*codec_dptr)->name);
+		status_info("initialization of %s failed!\n", (*codec_dptr)->name);
 		return false;
 	}
 	
-	printf("%s initialized\n", (*codec_dptr)->name);
+	status_info("%s initialized\n", (*codec_dptr)->name);
 	return true;
 }
 
@@ -134,7 +134,7 @@ void setup_filter_graph(AVCodecContext *video_codec_context_ptr, const char *fil
 		exit(8);
 	}
 	
-	// Build the use defined filter graph between the two ends
+	// Build the user defined filter graph between the two ends
 	AVFilterInOut *outputs = avfilter_inout_alloc();
 	AVFilterInOut *inputs = avfilter_inout_alloc();
 	
@@ -166,150 +166,13 @@ void cleanup_filter_graph(){
 }
 
 
-typedef struct {
-	uint8_t *data;
-	uint32_t size;
-	x264_picture_t pic;
-	x264_nal_t nals[8];
-	int nal_count;
-} x264_output_t;
-
-
-/**
- * Stores the output NALs of the x264 encoder. More or less the general output function that
- * takes care of writing the output videos.
- */
-void store_nal(int frame_size, x264_nal_t *nals, int nal_count, FILE *video_stream_dump, MP4FileHandle container, MP4TrackId *video_track_ptr, x264_picture_t *pic_ptr){
-	static x264_output_t prev_output = {.data = NULL, .size = 0};
-	
-	printf(" - x264");
-	
-	// Write the NALs directly to the raw dump
-	if (nals != NULL)
-		fwrite(nals[0].p_payload, frame_size, 1, video_stream_dump);
-	
-	if (prev_output.data != NULL) {
-		// We got a previous x264 output so we can calculate a proper decoding delta for the MP4 sample
-		int64_t decode_delta, composition_offset;
-		decode_delta = pic_ptr->i_dts - prev_output.pic.i_dts;
-		composition_offset = prev_output.pic.i_pts - prev_output.pic.i_dts;
-		printf(" - x264, prev: (dts: %ld, pts: %ld), curr: (dts: %ld, pts: %ld), dec delta: %ld, comp offset: %ld NALs:",
-			prev_output.pic.i_dts, prev_output.pic.i_pts, pic_ptr->i_dts, pic_ptr->i_pts, decode_delta, composition_offset);
-		
-		x264_nal_t* nal_ptr = NULL;
-		int i;
-		for(i = 0; i < prev_output.nal_count; i++){
-			nal_ptr = &prev_output.nals[i];
-			printf(" %d", nal_ptr->i_type);
-			switch(nal_ptr->i_type){
-				case NAL_SPS:
-					// If we have not created a video track yet, do so based on the first sequence parameter set
-					if (*video_track_ptr == MP4_INVALID_TRACK_ID){
-						uint8_t profile_idc, profile_compat, level_idc;
-						
-						// Extract some information from the sequence parameter set and use them
-						// to add a video track to the mp4 container.
-						// 
-						// SPS layout:
-						// 	byte 0 - 3	startcode (for Annex-B bytestreams) or payload size
-						//	byte 4		NAL header (for SPS NALs just the forbidden_zero_bit, nal_ref_idc and nal_unit_type)
-						// 	byte 5		profile_idc
-						//	byte 6		constraint set flags (profile compatibility flags)
-						//	byte 7		level_idc
-						//int j;
-						//printf("\nSPS size: %d header:", nal_ptr->i_payload);
-						//for(j = 0; j < 8; j++)
-						//	printf(" %02x", nal_ptr->p_payload[j]);
-						
-						profile_idc = nal_ptr->p_payload[5];
-						profile_compat = nal_ptr->p_payload[6];
-						level_idc = nal_ptr->p_payload[7];
-						//printf("... track: profile_idc %d, profile_compat %x, level_idc: %d\n", profile_idc, profile_compat, level_idc);
-						
-						// MP4 muxing does not work with Annex-B streams! If b_annexb is fals x264
-						// puts the payload length into the first 4 byte of the NALs. This is perfect for
-						// MP4. Therefore we set the sampleLenFieldSizeMinusOne parameter to 3.
-						// 
-						// Note: MP4_INVALID_SAMPLE_DURATION might work well for ASF streams
-						*video_track_ptr = MP4AddH264VideoTrack(container, time_base.num * time_base.den, MP4_INVALID_DURATION, width, height,
-							profile_idc, profile_compat, level_idc, 3);
-						if (*video_track_ptr == MP4_INVALID_TRACK_ID){
-							fprintf(stderr, "failed to create video track in mp4 file!\n");
-							exit(7);
-						}
-						
-						MP4AddPixelAspectRatio(container, *video_track_ptr, sample_aspect_ratio.num, sample_aspect_ratio.den);
-					}
-					
-					// Put the sequence parameter set into the MP4 container. Framing is provided
-					// by the container, therefore we don't need the leading 4 bytes (the payload size).
-					MP4AddH264SequenceParameterSet(container, *video_track_ptr, nal_ptr->p_payload + 4, nal_ptr->i_payload - 4);
-					break;
-				case NAL_PPS:
-					// Put the picture parameter set into the MP4 container. Framing is provided
-					// by the container, therefore we don't need the leading 4 bytes (the payload size).
-					MP4AddH264PictureParameterSet(container, *video_track_ptr, nal_ptr->p_payload + 4, nal_ptr->i_payload - 4);
-					break;
-				case NAL_FILLER:
-					// Throw filler data away (AVC spec wants it)
-					break;
-				default:
-					// Every thing else is data for the video track. Collect all remaining NALs and
-					// put them into one MP4 sample.
-					if (*video_track_ptr != MP4_INVALID_TRACK_ID) {
-						int remaining_nals = prev_output.nal_count - i;
-						uint8_t *start_ptr = prev_output.nals[i].p_payload;
-						int size = prev_output.size - ((void*)start_ptr - (void*)(prev_output.nals[0].p_payload));
-						
-						bool is_sync_sample = prev_output.pic.b_keyframe;
-						printf(" storing %d NALs, at %p, %d bytes", remaining_nals, start_ptr, size);
-						if ( MP4WriteSample(container, *video_track_ptr, start_ptr, size, decode_delta, composition_offset, is_sync_sample) != true)
-							printf(" MP4WriteSample (NAL %d) failed", i);
-						
-						i += remaining_nals;
-					} else {
-						printf(" ignoring because there is no video track! ");
-					}
-					break;
-			}
-		}		
-	}
-	
-	// Store the current x264 output as the previous output so we can calculate the decoding delta of the next sample
-	if (nals != NULL) {
-		printf(", buffering output");
-		if (prev_output.data != NULL)
-			free(prev_output.data);
-		prev_output.data = (uint8_t*) malloc(frame_size);
-		if (prev_output.data == NULL){
-			fprintf(stderr, "store_nal: failed to allcoate buffer for the x264 output!\n");
-			return;
-		}
-		memcpy(prev_output.data, nals[0].p_payload, frame_size);
-		prev_output.size = frame_size;
-		
-		prev_output.pic = *pic_ptr;
-		prev_output.nal_count = nal_count;
-		if (nal_count >= 8){
-			fprintf(stderr, "store_nal: received more NALs than the output buffer can hold!\n");
-			return;
-		}
-		
-		for(int i = 0; i < nal_count; i++){
-			prev_output.nals[i] = nals[i];
-			int offset = nals[i].p_payload - nals[0].p_payload;
-			prev_output.nals[i].p_payload = prev_output.data + offset;
-		}
-	} else {
-		printf(", flushing");
-	}
-}
 
 /**
  * Structure that contains the parsed command line options.
  */
 typedef struct {
-	// Flag for extensive logging output
+	// Flags for output
+	bool progress;
 	bool verbose;
 	// If this flag is set we just output the information about the input video and exit. This
 	// provides a way to know what streams are inside the file.
@@ -340,6 +203,7 @@ typedef struct {
 bool parse_cli_options(cli_options_t *options_ptr, int argc, char **argv){
 	// First fill with default options
 	cli_options_t defaults = {
+		.progress = true,
 		.verbose = false,
 		.analyze = false,
 		.input_file = NULL,
@@ -352,6 +216,7 @@ bool parse_cli_options(cli_options_t *options_ptr, int argc, char **argv){
 	
 	// Now parse the command line arguments
 	struct option long_opts[] = {
+		{"silent", no_argument, NULL, 's'},
 		{"verbose", no_argument, NULL, 2},
 		{"analyze", no_argument, NULL, 3},
 		{"video-stream", required_argument, NULL, 'v'},
@@ -363,11 +228,14 @@ bool parse_cli_options(cli_options_t *options_ptr, int argc, char **argv){
 	
 	int long_opt_index = 0, opt_abbr = 0;
 	while(true){
-		opt_abbr = getopt_long(argc, argv, "v:a:l:f:", long_opts, &long_opt_index);
+		opt_abbr = getopt_long(argc, argv, "sv:a:l:f:", long_opts, &long_opt_index);
 		if (opt_abbr == -1)
 			break;
 		
 		switch(opt_abbr){
+			case 's':
+				options_ptr->progress = false;
+				break;
 			case 2:
 				options_ptr->verbose = true;
 				break;
@@ -401,18 +269,39 @@ bool parse_cli_options(cli_options_t *options_ptr, int argc, char **argv){
 		return false;
 	}
 	
-	printf("verbose: %d\nanalyze: %d\ninput_file: %s\nvideo_stream_index: %d\naudio_stream_index: %d\nframe_limit: %ld\nvideo_filter: %s\n",
-		options_ptr->verbose, options_ptr->analyze, options_ptr->input_file,
+	fprintf(stderr, "progress: %d\nverbose: %d\nanalyze: %d\ninput_file: %s\nvideo_stream_index: %d\naudio_stream_index: %d\nframe_limit: %ld\nvideo_filter: %s\n",
+		options_ptr->progress, options_ptr->verbose, options_ptr->analyze, options_ptr->input_file,
 		options_ptr->video_stream_index, options_ptr->audio_stream_index,
 		options_ptr->frame_limit, options_ptr->video_filter);
 	
 	return true;
 }
 
+/*
+ * Stuff to output a nice display time
+ */
+typedef struct {
+	uint16_t hours;
+	uint8_t minutes, seconds;
+} display_time_t;
+
+display_time_t display_time(int64_t time_stamp, AVRational time_base){
+	int64_t seconds = time_stamp * av_q2d(time_base);
+	
+	uint16_t hours = seconds / (60LL * 60LL);
+	seconds -= hours * (60LL * 60LL);
+	uint8_t minutes = seconds / 60LL;
+	seconds -= minutes * 60LL;
+	
+	return (display_time_t){ .hours = hours, .minutes = minutes, .seconds = seconds };
+}
+
 int main(int argc, char **argv){
 	cli_options_t opts;
 	if ( ! parse_cli_options(&opts, argc, argv) )
 		return 1;
+	
+	status_init(opts.progress, opts.verbose);
 	
 	// Init libavformat and register all codecs
 	av_register_all();
@@ -423,7 +312,7 @@ int main(int argc, char **argv){
 	if ( ! reader_open_file(opts.input_file, &format_context_ptr) )
 		return 2;
 	
-	// Search for the first video and audio streams if the stream indecies are -1 (auto detect)
+	// Search for the video and audio streams with the highest bitrate if the stream indecies are -1 (auto detect)
 	if (opts.video_stream_index == -1){
 		int selected_bitrate = -1;
 		for(int i = 0; i < format_context_ptr->nb_streams; i++){
@@ -446,7 +335,7 @@ int main(int argc, char **argv){
 		}
 	}
 	
-	printf("Using video steam %d and audio steam %d\n", opts.video_stream_index, opts.audio_stream_index);
+	status_info("Using video steam %d and audio steam %d\n", opts.video_stream_index, opts.audio_stream_index);
 	
 	
 	// Open a decoder for the specified video stream
@@ -463,170 +352,92 @@ int main(int argc, char **argv){
 	time_base = video_codec_context_ptr->time_base;
 	sample_aspect_ratio = format_context_ptr->streams[opts.video_stream_index]->sample_aspect_ratio; //video_codec_context_ptr->sample_aspect_ratio;
 	
-	printf("Decoding video: width: %d, height: %d, time base: (%d/%d), fps: (%d/%d) %lf, sample aspect ratio: (%d/%d)\n",
+	status_info("Decoding video: width: %d, height: %d, time base: (%d/%d), fps: (%d/%d) %lf, sample aspect ratio: (%d/%d)\n",
 		width, height, time_base.num, time_base.den, time_base.den, time_base.num, 1 / av_q2d(time_base), sample_aspect_ratio.num, sample_aspect_ratio.den);
 	
-	// Init the filter graph
-	char *filters = NULL;
-	if (argc >= 5)
-		filters = argv[4];
-	else
-		filters = "hqdn3d,yadif";
-	setup_filter_graph(video_codec_context_ptr, filters);
+	// Init the filter graph if the user wants to use filters ("hqdn3d,yadif" good for DV raw material)
+	if (opts.video_filter != NULL)
+		setup_filter_graph(video_codec_context_ptr, opts.video_filter);
 	
-	// Init the x264 encoder
-	x264_param_t params;
-	if ( x264_param_default_preset(&params, "slow", "film") != 0 )	// use "zerolatency" tune to avoid out of order frames
-		fprintf(stderr, "x264: failed to set preset defaults\n");
+	if ( mp4_encoder_open("video.mp4", format_context_ptr->streams[opts.video_stream_index], NULL, format_context_ptr->streams[opts.audio_stream_index], NULL) != 0)
+		return 4;
 	
-	params.i_width = width;
-	params.i_height = height;
-	params.b_annexb = false;
-	// fps is the reciprocal of the time base
-	params.i_fps_num = time_base.den;
-	params.i_fps_den = time_base.num;
-	// Set the sample aspect ratio for the video stream since this information is also present in the h264 stream
-	params.vui.i_sar_width = sample_aspect_ratio.num;
-	params.vui.i_sar_height = sample_aspect_ratio.den;
-	
-	params.rc.i_rc_method = X264_RC_CRF;
-	params.rc.f_rf_constant = 20;
-	params.rc.f_rf_constant = 25;
-	
-	
-	if ( x264_param_apply_profile(&params, "high") != 0 )
-		fprintf(stderr, "x264: failed to apply profile\n");
-	x264_t *encoder_ptr = x264_encoder_open(&params);
-	if (encoder_ptr == NULL){
-		fprintf(stderr, "x264: failed to initialize encoder\n");
-		return 5;
-	}
-	
-	// Init the FAAC encoder
-	unsigned long faac_input_sample_count, faac_max_output_byte_count;
-	faacEncHandle faac_encoder = faacEncOpen(audio_codec_context_ptr->sample_rate, audio_codec_context_ptr->channels, &faac_input_sample_count, &faac_max_output_byte_count);
-	if (faac_encoder == NULL){
-		fprintf(stderr, "faac: failed to initialize encoder\n");
-		return 6;
-	}
-	
-	// Calculate the number of samples one frame is long (for one channel)
-	uint32_t aac_frame_size = faac_input_sample_count / audio_codec_context_ptr->channels;
-	
-	// Allocate buffers for the libavcodec output (the raw samples) and for the FAAC output (the AAC bitstream)
-	int sample_buffer_size = 2 * AVCODEC_MAX_AUDIO_FRAME_SIZE;
-	int sample_buffer_used = 0, sample_size = sizeof(int16_t);
-	int16_t *sample_buffer_ptr = (int16_t*) av_mallocz(sample_buffer_size);
-	
-	int aac_buffer_size = faac_max_output_byte_count;
-	uint8_t *aac_buffer_ptr = (uint8_t*) av_mallocz(faac_max_output_byte_count);
-	
-	if (sample_buffer_ptr == NULL || aac_buffer_ptr == NULL){
-		fprintf(stderr, "faac: failed to malloc buffer\n");
-		return 6;
-	}
-	
-	// Detail config of the encoder
-	faacEncConfigurationPtr faac_config_ptr = faacEncGetCurrentConfiguration(faac_encoder);
-	faac_config_ptr->mpegVersion = MPEG4;  // for Windows Media Player. It only accpets mpeg4 audio
-	faac_config_ptr->aacObjectType = LOW;  // for apple, these things can only play low profile
-	faac_config_ptr->inputFormat = FAAC_INPUT_16BIT;  // matches the raw output of the audio decoder (pcm_s16le)
-	faacEncSetConfiguration(faac_encoder, faac_config_ptr);
-	
-	
-	// Open the video stream dump file and the MP4 file
-	FILE *video_stream_dump = fopen("video.h264", "wb");
-	
-	MP4FileHandle container = MP4Create("video.mp4", 0);
-	if (container == MP4_INVALID_FILE_HANDLE){
-		fprintf(stderr, "MP4Create failed\n");
-		return 5;
-	}
-	//MP4SetTimeScale(container, time_base.num * time_base.den);
-	MP4SetAudioProfileLevel(container, 0x0f);
-	//MP4SetMetadataTool(container, "HdM encoder");
-	
-	// Define the video track. Changed later on when the first SPS (sequence parameter set) NAL is received
-	MP4TrackId video_track = MP4_INVALID_TRACK_ID;
-	
-	// Build the audio track
-	MP4TrackId audio_track = MP4AddAudioTrack(container, audio_codec_context_ptr->sample_rate, MP4_INVALID_DURATION, MP4_MPEG4_AUDIO_TYPE);
-	if (audio_track == MP4_INVALID_TRACK_ID){
-		fprintf(stderr, "MP4AddAudioTrack failed\n");
-		return 5;
-	}
-	
-	/* Leads to files that can not be played with Totem (gstreamer)
-	uint8_t *aac_config_ptr = NULL;
-	unsigned long aac_config_length = 0;
-	faacEncGetDecoderSpecificInfo(faac_encoder, &aac_config_ptr, &aac_config_length);
-	MP4SetTrackESConfiguration(container, audio_track, aac_config_ptr, aac_config_length);
-	free(aac_config_ptr);
-	*/
 	
 	// Read the packages of the container
 	AVFrame *frame_ptr = avcodec_alloc_frame();
 	int frame_decoded;
 	AVPacket packet;
 	
-	int nal_count;
-	x264_nal_t *nals;
-	x264_picture_t pic_in, pic_out;
+	int sample_buffer_size = AVCODEC_MAX_AUDIO_FRAME_SIZE;
+	int16_t *sample_buffer_ptr = (int16_t*) av_mallocz(sample_buffer_size);
+	
+	//int nal_count;
+	//x264_nal_t *nals;
+	//x264_picture_t pic_in, pic_out;
 	int frame_size, i, error;
 	uint64_t processed_frames = 0;
-	if ( x264_picture_alloc(&pic_in, X264_CSP_I420, width, height) != 0 )
-		fprintf(stderr, "x264: could not allocate picture\n");
+	//if ( x264_picture_alloc(&pic_in, X264_CSP_I420, width, height) != 0 )
+	//	fprintf(stderr, "x264: could not allocate picture\n");
 	
-	struct SwsContext* scaler = sws_getContext(width, height, video_codec_context_ptr->pix_fmt,
-		width, height, PIX_FMT_YUV420P,
-		SWS_FAST_BILINEAR, NULL, NULL, NULL);
-	
+
+	status_detail("Starting decoding...\n");
 	while( av_read_frame(format_context_ptr, &packet) >= 0 ){
 		if (packet.stream_index == opts.video_stream_index){
-			printf("VIDEO packet pts: %5ld, dts: %5ld", packet.pts, packet.dts);
-			
 			int bytes_decompressed = avcodec_decode_video2(video_codec_context_ptr, frame_ptr, &frame_decoded, &packet);
 			if (bytes_decompressed < 0)
 				av_perror("avcodec_decode_video2", bytes_decompressed);
 			
 			if (frame_decoded){
-				//printf("frame: pts: %ld, coded_picture_number: %d, display_picture_number: %d, quality: %d, age: %d\n",
-				//	frame_ptr->pts, frame_ptr->coded_picture_number, frame_ptr->display_picture_number, frame_ptr->quality, frame_ptr->age);
+				// Use the container (packet) PTS if the frame has no valid PTS on its own. This is the case for
+				// DV video files. We have to use the frame PTS because only that is available when we pull the
+				// frame out of the filter pipeline later on.
+				if (frame_ptr->pts == AV_NOPTS_VALUE || frame_ptr->pts == 0)
+					frame_ptr->pts = packet.pts;
 				
-				// Put the frame into the filter pipeline
-				error = av_vsrc_buffer_add_frame(src_filter_context_ptr, frame_ptr, AV_VSRC_BUF_FLAG_OVERWRITE);
-				if (error < 0)
-					av_perror("av_vsrc_buffer_add_frame", error);
-			}
-			
-			// Loop over all frames that the filter pipeline finished
-			while((error = avfilter_poll_frame(sink_filter_context_ptr->inputs[0])) > 0){
-				AVFilterBufferRef *buffer_ref_ptr = NULL;
+				display_time_t time = display_time(frame_ptr->pts, format_context_ptr->streams[opts.video_stream_index]->time_base);
+				status_detail("decode video: %2d:%02d:%02d PTS: %-5lu (packet pts: %-5lu, dts: %-5lu)\n",
+					time.hours, time.minutes, time.seconds, frame_ptr->pts, packet.pts, packet.dts);
+				//status_progress(0, "video: %2d:%02d:%02d (pts: %-5d dts: %-5d)",
+				//	time.hours, time.minutes, time.seconds, packet.pts, packet.dts);
+				//status_info("VIDEO packet pts: %5ld, dts: %5ld", packet.pts, packet.dts);
+
+				//status_info("frame PTS: %lu, packet PTS: %lu\n", frame_ptr->pts, packet.pts);
 				
-				// Get the frame out of the pipeline
-				error = av_vsink_buffer_get_video_buffer_ref(sink_filter_context_ptr, &buffer_ref_ptr, 0);
-				if (error < 0)
-					av_perror("av_vsink_buffer_get_video_buffer_ref", error);
-				error = avfilter_fill_frame_from_video_buffer_ref(frame_ptr, buffer_ref_ptr);
-				if (error < 0)
-					av_perror("avfilter_fill_frame_from_video_buffer_ref", error);
-				
-				// Give it to x264 to encode
-				pic_in.i_type = X264_TYPE_AUTO;
-				//pic_in.i_type = X264_TYPE_I;
-				pic_in.i_pts = packet.pts;
-				sws_scale(scaler, (const uint8_t * const*)frame_ptr->data, frame_ptr->linesize,
-					0, height, pic_in.img.plane, pic_in.img.i_stride);
-				
-				frame_size = x264_encoder_encode(encoder_ptr, &nals, &nal_count, &pic_in, &pic_out);
-				if ( frame_size < 0 )
-					fprintf(stderr, "x264: encoder error");
-				
-				if (frame_size > 0)
-					store_nal(frame_size, nals, nal_count, video_stream_dump, container, &video_track, &pic_out);
-				
-				// Free the buffer reference we got from the filter pipeline
-				avfilter_unref_buffer(buffer_ref_ptr);
+				if (opts.video_filter == NULL) {
+					// Give the decoded frame directly to the encoder if we don't use filter
+					if ( mp4_encoder_process_video(frame_ptr) < 0)
+						return 5;
+				} else {
+					if (frame_decoded){
+						//printf("frame: pts: %ld, coded_picture_number: %d, display_picture_number: %d, quality: %d, age: %d\n",
+						//	frame_ptr->pts, frame_ptr->coded_picture_number, frame_ptr->display_picture_number, frame_ptr->quality, frame_ptr->age);
+						
+						// Put the frame into the filter pipeline
+						error = av_vsrc_buffer_add_frame(src_filter_context_ptr, frame_ptr, AV_VSRC_BUF_FLAG_OVERWRITE);
+						if (error < 0)
+							av_perror("av_vsrc_buffer_add_frame", error);
+					}
+					
+					// Loop over all frames that the filter pipeline finished
+					while((error = avfilter_poll_frame(sink_filter_context_ptr->inputs[0])) > 0){
+						AVFilterBufferRef *buffer_ref_ptr = NULL;
+						
+						// Get the frame out of the pipeline
+						error = av_vsink_buffer_get_video_buffer_ref(sink_filter_context_ptr, &buffer_ref_ptr, 0);
+						if (error < 0)
+							av_perror("av_vsink_buffer_get_video_buffer_ref", error);
+						error = avfilter_fill_frame_from_video_buffer_ref(frame_ptr, buffer_ref_ptr);
+						if (error < 0)
+							av_perror("avfilter_fill_frame_from_video_buffer_ref", error);
+						
+						// Give the decoded and filtered frame to the encoder
+						if ( mp4_encoder_process_video(frame_ptr) < 0)
+							return 5;
+						
+						// Free the buffer reference we got from the filter pipeline
+						avfilter_unref_buffer(buffer_ref_ptr);
+					}
+				}
 				
 				processed_frames++;
 			}
@@ -637,14 +448,21 @@ int main(int argc, char **argv){
 			if (error < 0)
 				av_perror("avfilter_poll_frame", error);
 			
-			printf("\n");
+			//printf("\n");
 			
 			if (processed_frames > opts.frame_limit)
 				break;
 		}
 		
 		if (packet.stream_index == opts.audio_stream_index){
-			int sample_buffer_free = sample_buffer_size - sample_buffer_used;
+			int sample_buffer_filled = sample_buffer_size;
+			int bytes_consumed = avcodec_decode_audio3(audio_codec_context_ptr, sample_buffer_ptr, &sample_buffer_filled, &packet);
+			status_detail("decode audio: packet size: %d, bytes consumed: %d, bytes uncompessed: %d\n", packet.size, bytes_consumed, sample_buffer_filled);
+			
+			mp4_encoder_process_audio(sample_buffer_ptr, sample_buffer_filled);
+			
+			
+			/*
 			int bytes_consumed = avcodec_decode_audio3(audio_codec_context_ptr, sample_buffer_ptr + (sample_buffer_used / sample_size), &sample_buffer_free, &packet);
 			printf("AUDIO packet: size: %d, bytes consumed: %d, bytes uncompessed: %d\n", packet.size, bytes_consumed, sample_buffer_free);
 			
@@ -699,9 +517,13 @@ int main(int argc, char **argv){
 			if (bytes_consumed < 0){
 				fprintf(stderr, "faac: encoder error");
 			}
+			*/
 		}
 	}
 	
+	status_info("decoding finished\n");
+	
+	/*
 	// Process any buffered frames that are still in the encoder
 	while( x264_encoder_delayed_frames(encoder_ptr) > 0 ){
 		printf("delayed x264 frame");
@@ -744,23 +566,29 @@ int main(int argc, char **argv){
 		if (result != true)
 			fprintf(stderr, "faac: MP4WriteSample() failed\n");
 	}
+	*/
 	
 	// Clean up
-	fclose(video_stream_dump);
-	MP4Close(container, 0);
+	//fclose(video_stream_dump);
+	//MP4Close(container, 0);
 	//MP4MakeIsmaCompliant("video.mp4", mp4_verbosity, true);
 	
-	av_free(aac_buffer_ptr);
-	faacEncClose(faac_encoder);
+	//av_free(aac_buffer_ptr);
+	//faacEncClose(faac_encoder);
 	
-	x264_picture_clean(&pic_in);
-	x264_encoder_close(encoder_ptr);
+	//x264_picture_clean(&pic_in);
+	//x264_encoder_close(encoder_ptr);
+	
+	mp4_encoder_close();
+	status_detail("encoding finished\n");
 	
 	cleanup_filter_graph();
 	avcodec_close(video_codec_context_ptr);
 	av_close_input_file(format_context_ptr);
 	
 	avfilter_uninit();
+	
+	status_close();
 	
 	return 0;
 }
