@@ -354,6 +354,9 @@ int main(int argc, char **argv){
 	
 	status_info("Decoding video: width: %d, height: %d, time base: (%d/%d), fps: (%d/%d) %lf, sample aspect ratio: (%d/%d)\n",
 		width, height, time_base.num, time_base.den, time_base.den, time_base.num, 1 / av_q2d(time_base), sample_aspect_ratio.num, sample_aspect_ratio.den);
+	// TODO: use that for a meaningful progress display (in percent or so)
+	status_info ("Video start: %ld, duration: %ld, frames: %ld\n", format_context_ptr->streams[opts.video_stream_index]->start_time,
+		format_context_ptr->streams[opts.video_stream_index]->duration, format_context_ptr->streams[opts.video_stream_index]->nb_frames);
 	
 	// Init the filter graph if the user wants to use filters ("hqdn3d,yadif" good for DV raw material)
 	if (opts.video_filter != NULL)
