@@ -1,3 +1,6 @@
+#ifndef _QUEUE_H
+#define _QUEUE_H
+
 #include <pthread.h>
 #include <stdbool.h>
 
@@ -35,3 +38,5 @@ void queue_refilled(queue_t queue);
 
 void queue_detach_producer(queue_t queue);
 void queue_attach_producer(queue_t queue, unsigned int size, queue_buffer_allocator_t allocator, queue_buffer_deallocator_t deallocator, queue_buffer_cleaner_t cleaner);
+
+#endif
