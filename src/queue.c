@@ -17,7 +17,7 @@ queue_t queue_new(unsigned int size, queue_buffer_allocator_t allocator, queue_b
 	
 	queue_t queue = malloc(sizeof(struct queue_s));
 	assert(queue != NULL);
-
+	
 	// Set defaults
 	*queue = (struct queue_s){
 		.dirty_idx = 0, .dirty_buffers = 0, .filled_buffers = 0,
@@ -27,7 +27,7 @@ queue_t queue_new(unsigned int size, queue_buffer_allocator_t allocator, queue_b
 	// Setup threading primitives
 	int err = pthread_mutex_init(&queue->mutex, NULL);
 	assert(err == 0);
-
+	
 	err = pthread_cond_init(&queue->cond, NULL);
 	assert(err == 0);
 	
@@ -125,10 +125,10 @@ void* queue_push_begin(queue_t queue)
 int queue_push_end(queue_t queue)
 {
 	pthread_mutex_lock(&queue->mutex);
-
+	
 	assert(queue->pushing == true);
 	queue->pushing = false;
-
+	
 	queue->filled_buffers++;
 	
 	pthread_mutex_unlock(&queue->mutex);
@@ -139,30 +139,30 @@ int queue_push_end(queue_t queue)
 void* queue_pull_begin(queue_t queue)
 {
 	pthread_mutex_lock(&queue->mutex);
-
+	
 	assert(queue->pulling == false);
 	queue->pulling = true;
-
+	
 	while ( queue->filled_buffers < 1 ){
 		if (queue->drained){
 			pthread_mutex_unlock(&queue->mutex);
 			return NULL;
 		}
-
+	
 		pthread_cond_wait(&queue->cond, &queue->mutex);
 	}
-
+	
 	void* buffer = queue->buffers[out_idx(queue)];
 	
 	pthread_mutex_unlock(&queue->mutex);
-
+	
 	return buffer;
 }
 
 int queue_pull_end(queue_t queue)
 {
 	pthread_mutex_lock(&queue->mutex);
-
+	
 	assert(queue->pulling == true);
 	queue->pulling = false;
 	
