@@ -18,7 +18,7 @@ struct queue_s {
 	void **buffers;
 	
 	bool pushing, pulling;
-	bool drained;
+	bool drained, drained_ack;
 };
 
 typedef struct queue_s *queue_t;
@@ -32,3 +32,6 @@ int queue_pull_end(queue_t queue);
 
 void queue_drained(queue_t queue);
 void queue_refilled(queue_t queue);
+
+void queue_detach_producer(queue_t queue);
+void queue_attach_producer(queue_t queue, unsigned int size, queue_buffer_allocator_t allocator, queue_buffer_deallocator_t deallocator, queue_buffer_cleaner_t cleaner);
