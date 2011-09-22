@@ -1,85 +1,31 @@
 #include <assert.h>
-#include <pthread.h>
 #include <stdlib.h>
-#include <stdio.h>
+
+// Also include the mini queue functions
+#define QUEUE_MINIQUEUE
 #include "queue.h"
 
-
-//
-// Helper functions to calculate states of the queue that are not directly stored
-// as variables.
-//
-
-static inline size_t free_buffers(queue_t queue) {
-	return queue->size - (queue->dirty_buffers + queue->filled_buffers);
-}
-
-static inline size_t out_idx(queue_t queue) {
-	return (queue->dirty_idx + queue->dirty_buffers) % queue->size;
-}
-
-static inline size_t in_idx(queue_t queue) {
-	return (queue->dirty_idx + queue->dirty_buffers + queue->filled_buffers) % queue->size;
-}
+// Prototypes for heper functions
+static void queue_deallocate_buffers(queue_t queue);
+static void clean_dirty_buffers(queue_t queue);
 
 /**
- * Cleans all dirty buffers currently in the queue. This function requires that the queue
- * mutex is locked. Otherwise race conditions can easily happen.
+ * Creates a new detached queue. A consumer can pull from the queue immediately
+ * and will wait until a producer pushed a buffer. Producers however first need to attach
+ * themselfs to the queue before they can push buffers to it.
  */
-static void clean_dirty_buffers(queue_t queue)
+queue_t queue_new()
 {
-	while( queue->dirty_buffers > 0 ){
-		queue->cleaner(queue->buffers[queue->dirty_idx]);
-		queue->dirty_idx = (queue->dirty_idx + 1) % queue->size;
-		queue->dirty_buffers--;
-	}
-}
-
-static void queue_allocate_buffers(queue_t queue)
-{
-	assert(queue->size > 0);
-	
-	queue->buffers = malloc(queue->size * sizeof(void*));
-	assert(queue->buffers != NULL);
-	
-	for(int i = 0; i < queue->size; i++)
-		queue->buffers[i] = queue->allocator();
-}
-
-static void queue_deallocate_buffers(queue_t queue)
-{
-	// Return if there are no buffers allocated
-	if (queue->buffers == NULL)
-		return;
-	
-	clean_dirty_buffers(queue);
-	
-	for(int i = 0; i < queue->size; i++)
-		queue->deallocator(queue->buffers[i]);
-	
-	free(queue->buffers);
-	queue->buffers = NULL;
-}
-
-/**
- * Creates a new queue with `size` buffers in it. The `allocator` function is called `size` times to
-  * allocate all buffers.
- */
-queue_t queue_new(unsigned int size, queue_buffer_allocator_t allocator, queue_buffer_deallocator_t deallocator, queue_buffer_cleaner_t cleaner)
-{
-	assert(size > 0);
-	assert(allocator != NULL);
-	assert(deallocator != NULL);
-	assert(cleaner != NULL);
-	
 	queue_t queue = malloc(sizeof(struct queue_s));
 	assert(queue != NULL);
 	
 	// Set defaults
 	*queue = (struct queue_s){
-		.dirty_idx = 0, .dirty_buffers = 0, .filled_buffers = 0,
-		.pushing = false, .pulling = false,
-		.drained = false, .drained_ack = true
+		.allocator = NULL, .deallocator = NULL, .cleaner = NULL,
+		.free_head = NULL, .free_tail = NULL,
+		.filled_head = NULL, .filled_tail = NULL,
+		.dirty_head = NULL, .dirty_tail = NULL,
+		.pushed = NULL, .pulled = NULL
 	};
 	
 	// Setup threading primitives
@@ -89,26 +35,18 @@ queue_t queue_new(unsigned int size, queue_buffer_allocator_t allocator, queue_b
 	err = pthread_cond_init(&queue->cond, NULL);
 	assert(err == 0);
 	
-	// Setup the queue configuration
-	queue->size = size;
-	queue->allocator = allocator;
-	queue->deallocator = deallocator;
-	queue->cleaner = cleaner;
-	
-	// Setup the queue buffers
-	queue_allocate_buffers(queue);
-	
 	return queue;
 }
 
-
 /**
- * First cleans all dirty buffers and then deallocates all buffers. After that the
- * queue and all bound resources are destroyed.
+ * If the queue is still attached to a producer it is first detached (this includes waiting for the
+ * consumer to pull all remaining buffers). After that the queue and all bound resources are
+ * destroyed.
  */
 void queue_destroy(queue_t queue)
 {
-	queue_deallocate_buffers(queue);
+	if (queue->allocator != NULL)
+		queue_detach_producer(queue);
 	
 	int err = pthread_cond_destroy(&queue->cond);
 	assert(err == 0);
@@ -120,102 +58,22 @@ void queue_destroy(queue_t queue)
 
 
 /**
- * Returns an unused buffer from the queue. Note that this buffer might contain old data from previous usage.
- * If no unused buffer is available right now the function will block until a buffer is freed by another thread using
- * `queue_pull_end`.
+ * The producer takes possession of the queue by defining callbacks to handle buffers. After that
+ * the producer can start to push buffers into the queue.
  */
-void* queue_push_begin(queue_t queue)
+void queue_attach_producer(queue_t queue, queue_buffer_allocator_t allocator, queue_buffer_cleaner_t cleaner, queue_buffer_deallocator_t deallocator)
 {
-	pthread_mutex_lock(&queue->mutex);
-		assert(queue->pushing == false);
-		queue->pushing = true;
-		
-		clean_dirty_buffers(queue);
-		while( free_buffers(queue) < 1 ){
-			pthread_cond_wait(&queue->cond, &queue->mutex);
-			clean_dirty_buffers(queue);
-		}
-		
-		void* buffer = queue->buffers[in_idx(queue)];
-	pthread_mutex_unlock(&queue->mutex);
-
-	return buffer;
-}
-
-int queue_push_end(queue_t queue)
-{
+	assert(allocator != NULL);
+	assert(deallocator != NULL);
+	assert(cleaner != NULL);
+	
 	pthread_mutex_lock(&queue->mutex);
 	
-	assert(queue->pushing == true);
-	queue->pushing = false;
+	// Setup the queue callbacks
+	queue->allocator = allocator;
+	queue->deallocator = deallocator;
+	queue->cleaner = cleaner;
 	
-	queue->filled_buffers++;
-	
-	pthread_mutex_unlock(&queue->mutex);
-	
-	pthread_cond_signal(&queue->cond);
-}
-
-void* queue_pull_begin(queue_t queue)
-{
-	pthread_mutex_lock(&queue->mutex);
-	
-	assert(queue->pulling == false);
-	
-	while ( queue->filled_buffers < 1 ){
-		if (!queue->drained_ack){
-			queue->drained_ack = true;
-			pthread_mutex_unlock(&queue->mutex);
-			return NULL;
-		}
-	
-		pthread_cond_wait(&queue->cond, &queue->mutex);
-	}
-	
-	void* buffer = queue->buffers[out_idx(queue)];
-	queue->pulling = true;
-	
-	pthread_mutex_unlock(&queue->mutex);
-	
-	return buffer;
-}
-
-int queue_pull_end(queue_t queue)
-{
-	pthread_mutex_lock(&queue->mutex);
-	
-	assert(queue->pulling == true);
-	
-	queue->filled_buffers--;
-	queue->dirty_buffers++;
-	queue->pulling = false;
-	
-	pthread_mutex_unlock(&queue->mutex);
-	
-	pthread_cond_signal(&queue->cond);
-}
-
-/**
- * Marks the queue as "drained". That is `queue_pull_begin` does no longer wait if the queue is
- * empty but returns `NULL` immediately. It is guaranteed that `queue_pull_begin` will return
- * `NULL` at least once, even if `queue_refilled` is called emidiatly after this function.
- */
-void queue_drained(queue_t queue)
-{
-	pthread_mutex_lock(&queue->mutex);
-	queue->drained = true;
-	queue->drained_ack = false;
-	pthread_mutex_unlock(&queue->mutex);
-}
-
-/**
- * Removes the "drained" marking from the queue. After that `queue_pull_begin` blocks again
- * if the queue is empty.
- */
-void queue_refilled(queue_t queue)
-{
-	pthread_mutex_lock(&queue->mutex);
-	queue->drained = false;
 	pthread_mutex_unlock(&queue->mutex);
 }
 
@@ -224,36 +82,25 @@ void queue_refilled(queue_t queue)
  * and conditional variable intact. The consumer waiting on the cond variable will continue to
  * wait while the queue can be handed over to a new producer.
  * 
- * To do this we clean up all the buffers (so they are disposes of in the original thread where
+ * To do this we clean up all the buffers (so they are disposed of in the original thread where
  * they were created) and reset the configuration.
  * 
  * `queue_detach_producer` is ment to be called by the dying thread that wants to heand
  * over its queue. The receiving thread then needs to call `queue_attach_producer` to
- * reinitialize the queue and buffers.
- * 
- * A queue can only be handed over in "drained" state. That is you need to call `queue_drained`
- * before detaching it.
+ * reinitialize the queue and can preallocate new buffers.
  */
 void queue_detach_producer(queue_t queue)
 {
 	pthread_mutex_lock(&queue->mutex);
 	
-	assert(queue->drained == true);
-	
 	// Wait until all buffers have been consumed
-	while ( queue->filled_buffers > 0 )
+	while ( queue->filled_head != NULL )
 		pthread_cond_wait(&queue->cond, &queue->mutex);
 	
-	// Then signal the consumer so it _really_ knows that the queue is drained now.
-	// Background: just from consuming the buffers the consumer does not know that
-	// the queue is drained. In the worst cast it needs to wake up one more time to
-	// receive the `NULL` with `queue_pull_begin`.
-	pthread_cond_signal(&queue->cond);
-	
+	// Cleanup and deallocate buffers
 	queue_deallocate_buffers(queue);
-	
-	// Kill configuration
-	queue->size = 0;
+
+	// Kill callbacks
 	queue->allocator = NULL;
 	queue->deallocator = NULL;
 	queue->cleaner = NULL;
@@ -261,33 +108,203 @@ void queue_detach_producer(queue_t queue)
 	pthread_mutex_unlock(&queue->mutex);
 }
 
+
 /**
- * Attaches a new producer with the specified configuration. New buffers are allocated and
- * the queue is refilled automatically.
+ * Allocates `count` buffers of a specific `type`. This is only possible once after
+ * attaching to the queue. These buffers are then reused until the producer detatches
+ * itself or the queue is destroyed.
  */
-void queue_attach_producer(queue_t queue, unsigned int size, queue_buffer_allocator_t allocator, queue_buffer_deallocator_t deallocator, queue_buffer_cleaner_t cleaner)
+void queue_preallocate_buffers(queue_t queue, size_t count, int type)
 {
-	assert(size > 0);
-	assert(allocator != NULL);
-	assert(deallocator != NULL);
-	assert(cleaner != NULL);
+	assert(count > 0);
 	
 	pthread_mutex_lock(&queue->mutex);
+	assert(queue->free_head == NULL);
 	
-	// Reset the indices and mark the queue as refilled (drained == false)
-	queue->dirty_idx = 0;
-	queue->dirty_buffers = 0;
-	queue->filled_buffers = 0;
-	queue->drained = false;
+	queue->preallocated_type = type;
 	
-	// Setup the queue configuration
-	queue->size = size;
-	queue->allocator = allocator;
-	queue->deallocator = deallocator;
-	queue->cleaner = cleaner;
-	
-	// Setup the queue buffers
-	queue_allocate_buffers(queue);
+	for(int i = 0; i < count; i++){
+		queue_buffer_t *buffer = malloc(sizeof(queue_buffer_t));
+		buffer->type = type;
+		buffer->data = queue->allocator(type);
+		miniqueue_push(&queue->free_head, &queue->free_tail, buffer);
+	}
 	
 	pthread_mutex_unlock(&queue->mutex);
+}
+
+/**
+ * Cleans up all dirty buffers and then frees all preallocated buffers.
+ */
+static void queue_deallocate_buffers(queue_t queue)
+{
+	clean_dirty_buffers(queue);
+	
+	while(queue->free_head != NULL){
+		queue_buffer_t *buffer = miniqueue_pull(&queue->free_head, &queue->free_tail);
+		queue->deallocator(buffer->type, buffer->data);
+		free(buffer);
+	}
+}
+
+
+
+
+
+/**
+ * Returns an unused buffer from the queue. Note that this buffer might contain old data from previous usage.
+ * If no unused buffer is available right now the function will block until a buffer is freed by another thread using
+ * `queue_pull_end`.
+ */
+void* queue_push_begin(queue_t queue, int type)
+{
+	pthread_mutex_lock(&queue->mutex);
+	
+	assert(queue->pushed == NULL);
+	
+	clean_dirty_buffers(queue);
+	
+	queue_buffer_t *buffer = NULL;
+	if (queue->preallocated_type == type) {
+		// If we preallocated buffer of that type wait until a preallocated buffer is free and pull it
+		// of the free queue
+		while( queue->free_head == NULL ){
+			pthread_cond_wait(&queue->cond, &queue->mutex);
+			clean_dirty_buffers(queue);
+		}
+		buffer = miniqueue_pull(&queue->free_head, &queue->free_tail);
+	} else {
+		// No preallocated buffer available, allocate one
+		buffer = malloc(sizeof(queue_buffer_t));
+		buffer->type = type;
+		buffer->data = queue->allocator(type);
+	}
+	
+	// We need to remember the pushed buffer because we only return the `data` part of the buffer.
+	// Without the remembered buffer we don't know what we should put on the filled list on `queue_push_end`.
+	// Remember the pushed buffer so we know 
+	queue->pushed = buffer;
+	void *data = buffer->data;
+	
+	pthread_mutex_unlock(&queue->mutex);
+	
+	return data;
+}
+
+int queue_push_end(queue_t queue)
+{
+	pthread_mutex_lock(&queue->mutex);
+	
+	assert(queue->pushed != NULL);
+	miniqueue_push(&queue->filled_head, &queue->filled_tail, queue->pushed);
+	queue->pushed = NULL;
+	
+	pthread_mutex_unlock(&queue->mutex);
+	pthread_cond_signal(&queue->cond);
+}
+
+
+/**
+ * Pulls a buffer from the queue. This buffer can then be used until `queue_pull_end` is called which gives
+ * it back to the producer thread for cleanup and deallocation. The type of the pulled buffer is written into
+ * the variable pointed to by the `type` argument. `type` can be `NULL` if the type of the buffer is of no
+ * interest.
+ */
+void* queue_pull_begin(queue_t queue, int *type)
+{
+	pthread_mutex_lock(&queue->mutex);
+	
+	assert(queue->pulled == NULL);
+	
+	while ( queue->filled_head == NULL )
+		pthread_cond_wait(&queue->cond, &queue->mutex);
+	
+	queue->pulled = miniqueue_pull(&queue->filled_head, &queue->filled_tail);
+	assert(queue->pulled != NULL);
+	void* data = queue->pulled->data;
+	if (type != NULL)
+		*type = queue->pulled->type;
+	
+	pthread_mutex_unlock(&queue->mutex);
+	
+	return data;
+}
+
+int queue_pull_end(queue_t queue)
+{
+	pthread_mutex_lock(&queue->mutex);
+	
+	assert(queue->pulled != NULL);
+	miniqueue_push(&queue->dirty_head, &queue->dirty_tail, queue->pulled);
+	queue->pulled = NULL;
+	
+	pthread_mutex_unlock(&queue->mutex);
+	pthread_cond_signal(&queue->cond);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/**
+ * Cleans all dirty buffers currently in the queue. This function requires that the queue
+ * mutex is locked. Otherwise race conditions can easily happen.
+ * 
+ * Preallocated buffers are put into the free queue after they have been cleaned. Other
+ * buffers are given right to the deallocator.
+ */
+static void clean_dirty_buffers(queue_t queue)
+{
+	while( queue->dirty_head != NULL ){
+		queue_buffer_t *buffer = miniqueue_pull(&queue->dirty_head, &queue->dirty_tail);
+		queue->cleaner(buffer->type, buffer->data);
+		if (buffer->type != queue->preallocated_type) {
+			queue->deallocator(buffer->type, buffer->data);
+			free(buffer);
+		} else {
+			miniqueue_push(&queue->free_head, &queue->free_tail, buffer);
+		}
+	}
+}
+
+
+/**
+ * Pushes (appends) a new `buffer` to the mini queue represented by `head` and `tail`.
+ * The tail (and maybe head) of the mini queue are changed when pushing a buffer.
+ */
+void miniqueue_push(queue_buffer_t **head, queue_buffer_t **tail, queue_buffer_t *buffer)
+{
+	assert(buffer != NULL);
+	
+	if (*tail != NULL)
+		(*tail)->next = buffer;
+	else
+		*head = buffer;
+	*tail = buffer;
+	buffer->next = NULL;
+}
+
+/**
+ * Pulls a buffer out of the mini queue represented by `head` and `tail` and returns
+ * the pointer to a buffer struct. The head (and maybe the tail) are changed when
+ * pulling a buffer.
+ */
+queue_buffer_t* miniqueue_pull(queue_buffer_t **head, queue_buffer_t **tail)
+{
+	assert(*head != NULL);
+	
+	queue_buffer_t *buffer = *head;
+	*head = buffer->next;
+	if (buffer->next == NULL)
+		*tail = NULL;
+	return buffer;
 }
