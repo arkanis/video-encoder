@@ -1,5 +1,8 @@
 CFLAGS = --std=c99 -g
 
+encoder: encoder.c logger.o
+	gcc $(CFLAGS) encoder.c logger.o -o encoder
+
 # Some support stuff and test programms
 queue.o: queue.c queue.h
 	gcc $(CFLAGS) queue.c -c -o queue.o
@@ -15,3 +18,5 @@ logger_test: logger_test.c logger.o
 
 clean:
 	rm -f *.o
+	rm -f *_test
+	rm -f encoder
