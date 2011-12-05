@@ -1,0 +1,5 @@
+libasf
+libasf.o
+asf.h
+asf_reader
+av_view
