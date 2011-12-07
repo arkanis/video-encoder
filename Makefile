@@ -4,7 +4,7 @@
 #
 
 av_encode: av_encode.c libmp4v2.a
-	gcc --std=c99 -I libmp4v2/include av_encode.c libmp4v2.a -lavformat -lavcodec -lswscale -lavfilter -lstdc++ -o av_encode
+	gcc --std=c99 -I libmp4v2/include av_encode.c libmp4v2.a -lstdc++ -lavformat -lavcodec -lavfilter -lx264 -lfaac -o av_encode
 
 # The `LANG=en` on the second command is a workaround for the current
 # build script of libmp4v2.
