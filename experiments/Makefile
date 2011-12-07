@@ -7,6 +7,14 @@ av_view: av_view.c
 
 
 #
+#  A small sound player (without video) using pulse audio for output
+#
+
+av_listen: av_listen.c
+	gcc -g av_listen.c -lavformat -lavcodec -lpulse-simple -o av_listen
+
+
+#
 # Targets for the ASF test stuff. Get libasf from google code, compile it
 # into an object file and put the header file into the main dir. The library
 # is then used and compiled into the ASF test programs.
