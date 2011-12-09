@@ -113,6 +113,7 @@ void main(int argc, char **argv){
 		fprintf(stderr, __FILE__": pa_simple_new() failed: %s\n", pa_strerror(pa_error));
 	}
 	
+	setenv("PULSE_PROP_media.role", "video", 1);
 	
 	//
 	// Read data
