@@ -742,8 +742,6 @@ void enc_mp4_write_video_sample(
 }
 
 
-
-
 typedef struct {
 	uint8_t *payload_data;
 	size_t payload_size;
@@ -827,6 +825,9 @@ bool enc_mp4_mux_video(MP4FileHandle container, MP4TrackId video_track, x264_con
 }
 
 
+//
+// The main "pupetmaster" function coordinating all libraries
+//
 int main(int argc, char **argv){
 	// Parse the CLI options
 	cli_options_t opts;
@@ -953,12 +954,10 @@ int main(int argc, char **argv){
 			while( enc_avfilter_pull_to_x264_context(sink_filter_context_ptr, decoded_frame_ptr, &x264) )
 			{
 				x264.payload_size = x264_encoder_encode(x264.encoder, &x264.nals, &x264.nal_count, &x264.pic_in, &x264.pic_out);
-				if (x264.payload_size > 0) {
+				if (x264.payload_size > 0)
 					enc_mp4_mux_video(mp4_container, mp4_video_track, &x264);
-					//store_nal(x264.payload_size, x264.nals, x264.nal_count, mp4_container, &mp4_video_track, &x264.pic_out);
-				} else if ( x264.payload_size < 0 ) {
+				else if ( x264.payload_size < 0 )
 					fprintf(stderr, "x264: encoder error\n");
-				}
 			}
 			
 			// The x264 context contains the latest output picture. In there is the PTS of the latest encoded frame.
@@ -1058,18 +1057,15 @@ int main(int argc, char **argv){
 	while( x264_encoder_delayed_frames(x264.encoder) > 0 ){
 		debug("x264 delayed output frame\n");
 		x264.payload_size = x264_encoder_encode(x264.encoder, &x264.nals, &x264.nal_count, NULL, &x264.pic_out);
-		if (x264.payload_size > 0) {
+		if (x264.payload_size > 0)
 			enc_mp4_mux_video(mp4_container, mp4_video_track, &x264);
-			//store_nal(x264.payload_size, x264.nals, x264.nal_count, mp4_container, &mp4_video_track, &x264.pic_out);
-		} else if ( x264.payload_size < 0 ) {
+		else if ( x264.payload_size < 0 )
 			fprintf(stderr, "x264: encoder error");
-		}
 	}
 	
-	// Flush the NAL store function, it buffers one sample
+	// enc_mp4_mux_video() buffers one frame, flush it
 	x264.payload_size = 0;
 	enc_mp4_mux_video(mp4_container, mp4_video_track, &x264);
-	//store_nal(0, NULL, 0, mp4_container, &mp4_video_track, &x264.pic_out);
 	
 	// Process any remaining unencoded samples in the sample buffer
 	if (sample_buffer_used > 0){
