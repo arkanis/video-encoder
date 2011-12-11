@@ -973,33 +973,28 @@ int main(int argc, char **argv){
 			int sample_buffer_free = sample_buffer_size - sample_buffer_used;
 			int bytes_consumed = avcodec_decode_audio3(audio_codec_context_ptr, sample_buffer_ptr + (sample_buffer_used / sample_size), &sample_buffer_free, &packet);
 			
-			debug("audio packet: pts: %5ld, dts: %5ld size: %d, bytes consumed: %d, bytes uncompessed: %d\n",
-				packet.pts, packet.dts, packet.size, bytes_consumed, sample_buffer_free);
+			debug("audio packet: pts: %5ld, dts: %5ld size: %d, bytes uncompessed: %d\n",
+				packet.pts, packet.dts, packet.size, sample_buffer_free);
 			
-			if (bytes_consumed > 0){
+			if (bytes_consumed > 0) {
 				// sample_buffer_free now contains the number of bytes written into it by avcodec_decode_audio3()
 				sample_buffer_used += sample_buffer_free;
 				
-				//printf("  sample_buffer_used: %d, faac.input_sample_count: %ld, ",
-				//	sample_buffer_used, faac.input_sample_count);
-				
-				//printf("faac batches:");
 				int samples_to_encode = sample_buffer_used / sample_size;
 				int buffer_encoded = 0;
+				
+				debug("  samples to encode: %d, encoding batches: ", samples_to_encode);
 				while (samples_to_encode >= faac.input_sample_count){
-					//printf(" %ld", faac.input_sample_count);
+					debug(" %ld", faac.input_sample_count);
 					int encoded_bytes = faacEncEncode(faac.encoder,
-						(int32_t*)(sample_buffer_ptr + buffer_encoded / sample_size),
-						faac.input_sample_count,
+						(int32_t*)(sample_buffer_ptr + buffer_encoded / sample_size), faac.input_sample_count,
 						faac.buffer_ptr, faac.buffer_size);
 					
 					samples_to_encode -= faac.input_sample_count;
 					buffer_encoded += faac.input_sample_count * sample_size;
 					
-					if (encoded_bytes < 0)
-						fprintf(stderr, "faac: faacEncEncode() failed\n");
-					
-					if (encoded_bytes > 0){
+					if (encoded_bytes > 0) {
+						/*
 						// Ugly hack to test something...
 						static bool first_time = true;
 						MP4Duration offset = 0;
@@ -1011,30 +1006,29 @@ int main(int argc, char **argv){
 						bool result = MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, offset, true);
 						if (result != true)
 							fprintf(stderr, "faac: MP4WriteSample() failed\n");
-						
-						/*
-						double current_sec = packet.pts * av_q2d(audio_codec_context_ptr->time_base);
-						printf("audio pts: %ld, tb: %lf, sec: %lf\n", packet.pts, av_q2d(audio_codec_context_ptr->time_base), current_sec);
-						if (current_sec > encoded_audio_sec){
-							encoded_audio_sec = current_sec;
-							status_changed = true;
-						}
 						*/
+						
+						if ( ! MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, 0, true) )
+							fprintf(stderr, "    faac: MP4WriteSample() failed\n    ");
+						
+						// Update the audio encoding status
+						encoded_audio_sec += faac.frame_length / (double)audio_codec_context_ptr->sample_rate;
+						status_changed = true;
+					} else if (encoded_bytes < 0) {
+						fprintf(stderr, "    faac: faacEncEncode() failed\n    ");
 					}
 				}
-				//printf("\n");
+				debug("\n");
 				
 				// If not all data of the buffer was encoded move the remaining data to the front again
 				if (buffer_encoded > 0 && buffer_encoded < sample_buffer_used){
-					//printf("  moving %d bytes from %d to the front\n", sample_buffer_used - buffer_encoded, buffer_encoded);
+					debug("  moving %d bytes from position %d to the front\n", sample_buffer_used - buffer_encoded, buffer_encoded);
 					memmove(sample_buffer_ptr, sample_buffer_ptr + buffer_encoded / sample_size, sample_buffer_used - buffer_encoded);
 				}
 				
 				sample_buffer_used -= buffer_encoded;
-			}
-			
-			if (bytes_consumed < 0){
-				fprintf(stderr, "faac: encoder error");
+			} else if (bytes_consumed < 0) {
+				enc_av_perror("avcodec_decode_audio3", bytes_consumed);
 			}
 		}
 		
@@ -1067,31 +1061,27 @@ int main(int argc, char **argv){
 	x264.payload_size = 0;
 	enc_mp4_mux_video(mp4_container, mp4_video_track, &x264);
 	
-	// Process any remaining unencoded samples in the sample buffer
+	// Feed any remaining unencoded samples in the sample buffer to the FAAC encoder
 	if (sample_buffer_used > 0){
-		printf("delayed unencoded sample buffer: %d bytes\n", sample_buffer_used);
+		debug("delayed unencoded sample buffer: %d bytes\n", sample_buffer_used);
 		int encoded_bytes = faacEncEncode(faac.encoder,
-			(int32_t*)sample_buffer_ptr,
-			faac.input_sample_count,
+			(int32_t*)sample_buffer_ptr, faac.input_sample_count,
 			faac.buffer_ptr, faac.buffer_size);
 		
-		if (encoded_bytes < 0)
-			fprintf(stderr, "faac: faacEncEncode() failed\n");
-		
-		if (encoded_bytes > 0){
-			bool result = MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, 0, true);
-			if (result != true)
-				fprintf(stderr, "faac: MP4WriteSample() failed\n");
+		if (encoded_bytes > 0) {
+			if ( ! MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, 0, true) )
+				fprintf(stderr, "  faac: MP4WriteSample() failed\n");
+		} else if (encoded_bytes < 0) {
+			fprintf(stderr, "  faac: faacEncEncode() failed\n");
 		}
 	}
 	
-	// Process any buffered AAC frames still in the encoder
+	// Flush any buffered AAC frames still in the encoder
 	int encoded_bytes = 0;
 	while ( (encoded_bytes = faacEncEncode(faac.encoder, NULL, 0, faac.buffer_ptr, faac.buffer_size)) > 0 ){
-		printf("delayed AAC frame\n");
-		bool result = MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, 0, true);
-		if (result != true)
-			fprintf(stderr, "faac: MP4WriteSample() failed\n");
+		debug("FAAC delayed frame\n");
+		if ( ! MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, 0, true) )
+			fprintf(stderr, "  faac: MP4WriteSample() failed\n");
 	}
 	
 	// Clean up
