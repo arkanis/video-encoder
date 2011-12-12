@@ -930,11 +930,9 @@ int main(int argc, char **argv){
 	double duration_sec = format_context_ptr->duration / (double) AV_TIME_BASE;
 	
 	uint64_t start_video_pts = 0, start_audio_pts = 0;
-	struct timespec start, now;
+	struct timespec start, now, last_progress_message;
 	clock_gettime(CLOCK_REALTIME, &start);
-	
-	//double encoded_video_sec = 0.0, encoded_audio_sec = 0.0;
-	//bool status_changed = true;
+	last_progress_message = start;
 	
 	int error;
 	while( av_read_frame(format_context_ptr, &packet) >= 0 )
@@ -977,13 +975,6 @@ int main(int argc, char **argv){
 			// The x264 context contains the latest output picture. In there is the PTS of the latest encoded frame.
 			// Use it to update the video encoding progress.
 			encoded_video_pts = x264.pic_out.i_pts;
-			/*
-			double current_sec = x264.pic_out.i_pts * av_q2d(video_codec_context_ptr->time_base);
-			if (current_sec > encoded_video_sec){
-				encoded_video_sec = current_sec;
-				status_changed = true;
-			}
-			*/
 		}
 		else if (packet.stream_index == opts.audio_stream_index)
 		{
@@ -1016,10 +1007,6 @@ int main(int argc, char **argv){
 						
 						// Update the audio encoding progress
 						encoded_audio_pts += faac.frame_length;
-						/*
-						encoded_audio_sec += faac.frame_length / (double)audio_codec_context_ptr->sample_rate;
-						status_changed = true;
-						*/
 					} else if (encoded_bytes < 0) {
 						fprintf(stderr, "    faac: faacEncEncode() failed\n    ");
 					}
@@ -1041,22 +1028,21 @@ int main(int argc, char **argv){
 		// Print new status information to the terminal (unless we are in silent mode)
 		if (!opts.silent){
 			clock_gettime(CLOCK_REALTIME, &now);
-			double interval_duration = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1000000000.0;
-			if (interval_duration > 1){
-				start = now;
-				// Refresh the progress every second
+			double last_progress_ago = (now.tv_sec - last_progress_message.tv_sec) + (now.tv_nsec - last_progress_message.tv_nsec) / 1000000000.0;
+			// Refresh the progress status message every once in a while
+			if (last_progress_ago > 0.5){
+				double encoded_duration = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1000000000.0;
+				
 				display_time_t video_time, audio_time;
 				video_time = display_time(encoded_video_pts, video_codec_context_ptr->time_base);
 				audio_time = display_time(encoded_audio_pts, (AVRational){ .num = 1, .den = audio_codec_context_ptr->sample_rate });
 				
 				double delta_video_sec = (encoded_video_pts - start_video_pts) * av_q2d(video_codec_context_ptr->time_base);
-				start_video_pts = encoded_video_pts;
 				double delta_audio_sec = (encoded_audio_pts - start_audio_pts) / (double)audio_codec_context_ptr->sample_rate;
-				start_audio_pts = encoded_audio_pts;
 				
 				double left_video_sec = duration_sec - video_time.entire_seconds;
 				double left_audio_sec = duration_sec - audio_time.entire_seconds;
-				double left_encoding_time_sec = (left_video_sec / delta_video_sec + left_audio_sec / delta_audio_sec) * interval_duration;
+				double left_encoding_time_sec = (left_video_sec / delta_video_sec + left_audio_sec / delta_audio_sec) * encoded_duration;
 				display_time_t left_time = display_time_from_secs(left_encoding_time_sec);
 				
 				printf("\rvideo: %d:%02d:%02d (%.1lf%%) audio: %d:%02d:%02d (%.1lf%%) - time left: %d:%02d:%02d",
@@ -1067,6 +1053,15 @@ int main(int argc, char **argv){
 					printf("\n");
 				else
 					fflush(stdout);
+				
+				last_progress_message = now;
+				
+				// We can reset the values used for the progress updates to limit the information used
+				// for the prediction to the time span since the last update. This however gives a rather
+				// jumpy estimated time.
+				//start = now;
+				//start_video_pts = encoded_video_pts;
+				//start_audio_pts = encoded_audio_pts;
 			}
 		}
 	}
@@ -1085,6 +1080,7 @@ int main(int argc, char **argv){
 	}
 	
 	// enc_mp4_mux_video() buffers one frame, flush it
+	debug("flushing mp4 muxer\n");
 	x264.payload_size = 0;
 	enc_mp4_mux_video(mp4_container, mp4_video_track, &x264);
 	
