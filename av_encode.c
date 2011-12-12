@@ -4,12 +4,14 @@
  * and the MPEG4 spec.
  */
 
+// This is for time.h to include struct timespec (since it's from POSIX)
+#define _XOPEN_SOURCE 600
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <unistd.h>
-
-// For option parsing
 #include <getopt.h>
+#include <time.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -224,17 +226,22 @@ int64_t format_pts(int64_t pts){
 typedef struct {
 	uint16_t hours;
 	uint8_t minutes, seconds;
+	double entire_seconds;
 } display_time_t;
 
-display_time_t display_time(int64_t time_stamp, AVRational time_base){
-	int64_t seconds = time_stamp * av_q2d(time_base);
-
+display_time_t display_time_from_secs(double entire_seconds){
+	int64_t seconds = entire_seconds;
+	
 	uint16_t hours = seconds / (60LL * 60LL);
 	seconds -= hours * (60LL * 60LL);
 	uint8_t minutes = seconds / 60LL;
 	seconds -= minutes * 60LL;
+	
+	return (display_time_t){ .hours = hours, .minutes = minutes, .seconds = seconds, .entire_seconds = entire_seconds };
+}
 
-	return (display_time_t){ .hours = hours, .minutes = minutes, .seconds = seconds };
+display_time_t display_time(int64_t time_stamp, AVRational time_base){
+	return display_time_from_secs( time_stamp * av_q2d(time_base) );
 }
 
 
@@ -918,9 +925,16 @@ int main(int argc, char **argv){
 	
 	// Read all packages from the input file
 	printf("Initialization completed, starting decoding and encoding...\n");
-	double encoded_video_sec = 0.0, encoded_audio_sec = 0.0;
+	
+	int64_t encoded_video_pts = 0, encoded_audio_pts = 0;
 	double duration_sec = format_context_ptr->duration / (double) AV_TIME_BASE;
-	bool status_changed = true;
+	
+	uint64_t start_video_pts = 0, start_audio_pts = 0;
+	struct timespec start, now;
+	clock_gettime(CLOCK_REALTIME, &start);
+	
+	//double encoded_video_sec = 0.0, encoded_audio_sec = 0.0;
+	//bool status_changed = true;
 	
 	int error;
 	while( av_read_frame(format_context_ptr, &packet) >= 0 )
@@ -961,12 +975,15 @@ int main(int argc, char **argv){
 			}
 			
 			// The x264 context contains the latest output picture. In there is the PTS of the latest encoded frame.
-			// Use it to update the status.
+			// Use it to update the video encoding progress.
+			encoded_video_pts = x264.pic_out.i_pts;
+			/*
 			double current_sec = x264.pic_out.i_pts * av_q2d(video_codec_context_ptr->time_base);
 			if (current_sec > encoded_video_sec){
 				encoded_video_sec = current_sec;
 				status_changed = true;
 			}
+			*/
 		}
 		else if (packet.stream_index == opts.audio_stream_index)
 		{
@@ -994,26 +1011,15 @@ int main(int argc, char **argv){
 					buffer_encoded += faac.input_sample_count * sample_size;
 					
 					if (encoded_bytes > 0) {
-						/*
-						// Ugly hack to test something...
-						static bool first_time = true;
-						MP4Duration offset = 0;
-						if (first_time){
-							offset = faac.frame_length;
-							first_time = false;
-						}
-						
-						bool result = MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, offset, true);
-						if (result != true)
-							fprintf(stderr, "faac: MP4WriteSample() failed\n");
-						*/
-						
 						if ( ! MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, 0, true) )
 							fprintf(stderr, "    faac: MP4WriteSample() failed\n    ");
 						
-						// Update the audio encoding status
+						// Update the audio encoding progress
+						encoded_audio_pts += faac.frame_length;
+						/*
 						encoded_audio_sec += faac.frame_length / (double)audio_codec_context_ptr->sample_rate;
 						status_changed = true;
+						*/
 					} else if (encoded_bytes < 0) {
 						fprintf(stderr, "    faac: faacEncEncode() failed\n    ");
 					}
@@ -1033,19 +1039,40 @@ int main(int argc, char **argv){
 		}
 		
 		// Print new status information to the terminal (unless we are in silent mode)
-		if (!opts.silent && status_changed){
-			printf("\rvideo: %.1lfs (%.0lf%%) audio: %.1lfs (%.0lf%%)",
-				encoded_video_sec, encoded_video_sec / duration_sec * 100,
-				encoded_audio_sec, encoded_audio_sec / duration_sec * 100);
-			if (debug_show)
-				printf("\n");
-			else
-				fflush(stdout);
-			status_changed = false;
+		if (!opts.silent){
+			clock_gettime(CLOCK_REALTIME, &now);
+			double interval_duration = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1000000000.0;
+			if (interval_duration > 1){
+				start = now;
+				// Refresh the progress every second
+				display_time_t video_time, audio_time;
+				video_time = display_time(encoded_video_pts, video_codec_context_ptr->time_base);
+				audio_time = display_time(encoded_audio_pts, (AVRational){ .num = 1, .den = audio_codec_context_ptr->sample_rate });
+				
+				double delta_video_sec = (encoded_video_pts - start_video_pts) * av_q2d(video_codec_context_ptr->time_base);
+				start_video_pts = encoded_video_pts;
+				double delta_audio_sec = (encoded_audio_pts - start_audio_pts) / (double)audio_codec_context_ptr->sample_rate;
+				start_audio_pts = encoded_audio_pts;
+				
+				double left_video_sec = duration_sec - video_time.entire_seconds;
+				double left_audio_sec = duration_sec - audio_time.entire_seconds;
+				double left_encoding_time_sec = (left_video_sec / delta_video_sec + left_audio_sec / delta_audio_sec) * interval_duration;
+				display_time_t left_time = display_time_from_secs(left_encoding_time_sec);
+				
+				printf("\rvideo: %d:%02d:%02d (%.1lf%%) audio: %d:%02d:%02d (%.1lf%%) - time left: %d:%02d:%02d",
+					video_time.hours, video_time.minutes, video_time.seconds, video_time.entire_seconds / duration_sec * 100,
+					audio_time.hours, audio_time.minutes, audio_time.seconds, audio_time.entire_seconds / duration_sec * 100,
+					left_time.hours, left_time.minutes, left_time.seconds);
+				if (debug_show)
+					printf("\n");
+				else
+					fflush(stdout);
+			}
 		}
 	}
 	
-	printf("Decoding finished, flushing encoders...\n");
+	if (!opts.silent)
+		printf("\nDecoding finished, flushing encoders...\n");
 	
 	// Process any buffered frames that are still in the encoder
 	while( x264_encoder_delayed_frames(x264.encoder) > 0 ){
