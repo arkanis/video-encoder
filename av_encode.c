@@ -569,6 +569,7 @@ typedef struct {
 	unsigned long input_sample_count;
 	// Number of samples on AAC frame is long (only one channel). This is useful for MP4 muxing.
 	uint32_t frame_length;
+	int64_t last_pts;
 	// Buffer for the FAAC output (the AAC bitstream)
 	int buffer_size;
 	uint8_t *buffer_ptr;
@@ -586,6 +587,7 @@ bool enc_faac_open(AVCodecContext *audio_codec_context_ptr, faac_context_t *faac
 	}
 	
 	faac->frame_length = faac->input_sample_count / audio_codec_context_ptr->channels;
+	faac->last_pts = 0;
 	faac->buffer_size = max_output_byte_count;
 	faac->buffer_ptr = (uint8_t*) av_mallocz(max_output_byte_count);
 	
@@ -981,7 +983,7 @@ int main(int argc, char **argv){
 			int sample_buffer_free = sample_buffer_size - sample_buffer_used;
 			int bytes_consumed = avcodec_decode_audio3(audio_codec_context_ptr, sample_buffer_ptr + (sample_buffer_used / sample_size), &sample_buffer_free, &packet);
 			
-			debug("audio packet: pts: %5ld, dts: %5ld size: %d, bytes uncompessed: %d\n",
+			debug("audio packet: pts: %ld, dts: %ld size: %d, bytes uncompessed: %d\n",
 				packet.pts, packet.dts, packet.size, sample_buffer_free);
 			
 			if (bytes_consumed > 0) {
@@ -991,7 +993,7 @@ int main(int argc, char **argv){
 				int samples_to_encode = sample_buffer_used / sample_size;
 				int buffer_encoded = 0;
 				
-				debug("  samples to encode: %d, encoding batches: ", samples_to_encode);
+				debug("  samples to encode: %d, encoding batches:", samples_to_encode);
 				while (samples_to_encode >= faac.input_sample_count){
 					debug(" %ld", faac.input_sample_count);
 					int encoded_bytes = faacEncEncode(faac.encoder,
@@ -1002,6 +1004,7 @@ int main(int argc, char **argv){
 					buffer_encoded += faac.input_sample_count * sample_size;
 					
 					if (encoded_bytes > 0) {
+						debug(" w");
 						if ( ! MP4WriteSample(mp4_container, mp4_audio_track, faac.buffer_ptr, encoded_bytes, faac.frame_length, 0, true) )
 							fprintf(stderr, "    faac: MP4WriteSample() failed\n    ");
 						
